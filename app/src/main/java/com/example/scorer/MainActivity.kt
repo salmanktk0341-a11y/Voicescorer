@@ -19,10 +19,10 @@ import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
 import org.vosk.android.StorageService
 
-const val TOTAL_OVERS = 20      // overs ki hadd yahan badlo
+const val TOTAL_OVERS = 20      // change the over limit here
 const val BALLS_PER_OVER = 6
 const val PLAYERS = 11
-const val MIN_CONF = 0.5        // awaz ka yaqeen: barha do to sakhti barhegi
+const val MIN_CONF = 0.8        // higher = stricter, lower = more forgiving
 
 class State {
     var total = 0; var wickets = 0; var balls = 0; var extras = 0; var cur = 0
@@ -38,12 +38,14 @@ class State {
 }
 
 class MainActivity : Activity(), RecognitionListener {
-    // Sirf ye lafz kaam karte hain
+    // Only these words count
     private val REAL = listOf("dot", "zero", "one", "two", "three", "four", "five", "six",
         "out", "wide", "no ball", "undo")
-    // Milte-julte lafz: sunay jayen to ignore ho jayen
+    // Look-alike words: if heard, the whole phrase is ignored
     private val DECOYS = listOf("x", "sex", "sick", "sit", "seeks", "sax", "fix", "floor",
-        "door", "want", "tree", "free", "ten", "nine", "eight", "seven", "now", "wild")
+        "door", "want", "tree", "free", "ten", "nine", "eight", "seven", "now", "wild",
+        "the", "that", "thaw", "though", "run", "runs", "on", "than", "then", "wine",
+        "white", "why", "far", "fur", "fall", "fort", "dog", "dock", "and", "under", "end")
     private val COMMANDS = REAL.filter { it != "no ball" }.toSet()
     private val GRAMMAR: String = JSONArray(REAL + DECOYS + listOf("[unk]")).toString()
 
@@ -187,11 +189,11 @@ class MainActivity : Activity(), RecognitionListener {
     override fun onRequestPermissionsResult(code: Int, p: Array<out String>, r: IntArray) {
         super.onRequestPermissionsResult(code, p, r)
         if (r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED) initModel()
-        else tvHeard.text = "Mic ki ijazat chahiye (Settings se do)"
+        else tvHeard.text = "Microphone permission is needed (allow it in Settings)"
     }
 
     private fun initModel() {
-        tvHeard.text = "Awaz ka model load ho raha hai..."
+        tvHeard.text = "Loading voice model..."
         StorageService.unpack(this, "model-en-us", "model",
             { m: Model -> model = m; startMic() },
             { e: java.io.IOException -> tvHeard.text = "Model error: " + e.message })
@@ -202,7 +204,7 @@ class MainActivity : Activity(), RecognitionListener {
         rec.setWords(true)
         speech = SpeechService(rec, 16000.0f)
         speech!!.startListening(this)
-        tvHeard.text = "Tayyar. Bolo: one, two, four, six, out, wide, no ball, undo"
+        tvHeard.text = "Ready. Say: one, two, three, four, six, out, wide, no ball, undo"
     }
 
     private fun toggleMic() {
@@ -212,12 +214,12 @@ class MainActivity : Activity(), RecognitionListener {
     }
 
     private fun confirmNew() {
-        AlertDialog.Builder(this).setMessage("Naya innings? Purana score mit jayega.")
-            .setPositiveButton("Haan") { _, _ -> st = State(); history.clear(); refresh() }
-            .setNegativeButton("Nahi", null).show()
+        AlertDialog.Builder(this).setMessage("Start a new innings? The current score will be lost.")
+            .setPositiveButton("Yes") { _, _ -> st = State(); history.clear(); refresh() }
+            .setNegativeButton("No", null).show()
     }
 
-    // ---- awaz ----
+    // ---- voice ----
     override fun onResult(h: String?) {
         if (h == null) return
         val j = JSONObject(h)
@@ -226,7 +228,9 @@ class MainActivity : Activity(), RecognitionListener {
         if (arr != null) {
             for (i in 0 until arr.length()) {
                 val o = arr.getJSONObject(i)
+                // A low-confidence word poisons the whole phrase
                 if (o.optDouble("conf", 1.0) >= MIN_CONF) words.add(o.optString("word"))
+                else words.add("[low]")
             }
         } else {
             val t = j.optString("text", "")
@@ -241,27 +245,34 @@ class MainActivity : Activity(), RecognitionListener {
     override fun onTimeout() {}
 
     private fun handle(words: List<String>) {
+        // If anything in the phrase is not a clean command, ignore the entire phrase
+        val bad = words.filter { it != "no" && it != "ball" && it !in COMMANDS }
+        if (bad.isNotEmpty()) {
+            tvHeard.text = "Ignored: " + words.joinToString(" ")
+            return
+        }
         var k = 0
         while (k < words.size) {
             val w = words[k]
-            if (w == "no" && k + 1 < words.size && words[k + 1] == "ball") {
-                apply("noball"); k += 2; continue
+            if (w == "no") {
+                if (k + 1 < words.size && words[k + 1] == "ball") { apply("noball"); k += 2 }
+                else { tvHeard.text = "Ignored: no"; k++ }
+                continue
             }
-            if (w in COMMANDS) apply(w)
-            else if (w.isNotEmpty() && w != "[unk]") tvHeard.text = "Ignore: $w"
-            k++
+            if (w == "ball") { k++; continue }
+            apply(w); k++
         }
     }
 
-    // ---- score ----
+    // ---- scoring ----
     private fun finished() = st.wickets >= PLAYERS || st.balls >= TOTAL_OVERS * BALLS_PER_OVER
 
     private fun apply(cmd: String) {
         if (cmd == "undo") {
             if (history.isNotEmpty()) st = history.removeAt(history.size - 1)
-            tvHeard.text = "Suna: undo"; refresh(); return
+            tvHeard.text = "Heard: undo"; refresh(); return
         }
-        if (finished()) { tvHeard.text = "Innings khatam"; return }
+        if (finished()) { tvHeard.text = "Innings over"; return }
         val snap = st.copy()
         val i = st.cur
         var legal = true
@@ -280,9 +291,9 @@ class MainActivity : Activity(), RecognitionListener {
             }
         }
         history.add(snap)
-        var msg = "Suna: $cmd"
-        if (legal && st.balls > 0 && st.balls % BALLS_PER_OVER == 0) msg += "  (over khatam)"
-        if (finished()) msg = "Innings khatam"
+        var msg = "Heard: $cmd"
+        if (legal && st.balls > 0 && st.balls % BALLS_PER_OVER == 0) msg += "  (over complete)"
+        if (finished()) msg = "Innings over"
         tvHeard.text = msg
         (getSystemService(VIBRATOR_SERVICE) as Vibrator).vibrate(60)
         refresh()
@@ -299,7 +310,7 @@ class MainActivity : Activity(), RecognitionListener {
 
         tableBox.removeAllViews()
         tableBox.addView(tableRow(listOf("BATSMAN", "R", "B", "4s", "6s", "SR"), GREEN, Color.WHITE, true))
-        val last = if (finished()) minOf(st.cur, PLAYERS - 1) else minOf(st.cur, PLAYERS - 1)
+        val last = minOf(st.cur, PLAYERS - 1)
         for (i in 0..last) {
             val isCur = (i == st.cur && !finished())
             val name = (if (isCur) "▶ " else "") + "Player ${i + 1}" + (if (st.out[i]) " (out)" else "")
