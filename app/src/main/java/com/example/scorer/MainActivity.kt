@@ -8,14 +8,21 @@ import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Vibrator
+import android.view.Gravity
 import android.view.WindowManager
 import android.widget.*
+import org.json.JSONArray
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
 import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
 import org.vosk.android.StorageService
+
+const val TOTAL_OVERS = 20      // overs ki hadd yahan badlo
+const val BALLS_PER_OVER = 6
+const val PLAYERS = 11
+const val MIN_CONF = 0.5        // awaz ka yaqeen: barha do to sakhti barhegi
 
 class State {
     var total = 0; var wickets = 0; var balls = 0; var extras = 0; var cur = 0
@@ -31,52 +38,145 @@ class State {
 }
 
 class MainActivity : Activity(), RecognitionListener {
-    private val N = 11
-    // Sirf yehi lafz suna jayega, baqi sab [unk] ban kar ignore hota hai
-    private val GRAMMAR = "[\"dot\",\"zero\",\"one\",\"two\",\"three\",\"four\",\"five\",\"six\"," +
-            "\"out\",\"wide\",\"no ball\",\"undo\",\"[unk]\"]"
+    // Sirf ye lafz kaam karte hain
+    private val REAL = listOf("dot", "zero", "one", "two", "three", "four", "five", "six",
+        "out", "wide", "no ball", "undo")
+    // Milte-julte lafz: sunay jayen to ignore ho jayen
+    private val DECOYS = listOf("x", "sex", "sick", "sit", "seeks", "sax", "fix", "floor",
+        "door", "want", "tree", "free", "ten", "nine", "eight", "seven", "now", "wild")
+    private val COMMANDS = REAL.filter { it != "no ball" }.toSet()
+    private val GRAMMAR: String = JSONArray(REAL + DECOYS + listOf("[unk]")).toString()
 
+    private val GREEN = Color.parseColor("#2E7D32")
     private var st = State()
     private val history = ArrayList<State>()
     private var model: Model? = null
     private var speech: SpeechService? = null
     private var micOn = true
 
-    private lateinit var tvTotal: TextView
-    private lateinit var tvInfo: TextView
-    private lateinit var tvBat: TextView
+    private lateinit var tvScore: TextView
+    private lateinit var tvOvers: TextView
+    private lateinit var tvCrr: TextView
+    private lateinit var tvExtras: TextView
+    private lateinit var tvProj: TextView
+    private lateinit var tvLeft: TextView
     private lateinit var tvHeard: TextView
-    private lateinit var tvList: TextView
+    private lateinit var tableBox: LinearLayout
     private lateinit var btnMic: Button
 
-    private fun tv(size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
-        textSize = size; setTextColor(color)
-        if (bold) setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun cell(text: String, weight: Float, bold: Boolean, color: Int, gravity: Int): TextView {
+        val t = TextView(this)
+        t.text = text; t.textSize = 14f; t.setTextColor(color); t.gravity = gravity
+        if (bold) t.setTypeface(null, Typeface.BOLD)
+        t.layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, weight)
+        return t
+    }
+
+    private fun tableRow(vals: List<String>, bg: Int, fg: Int, bold: Boolean): LinearLayout {
+        val r = LinearLayout(this)
+        r.orientation = LinearLayout.HORIZONTAL
+        r.setBackgroundColor(bg)
+        r.setPadding(dp(10), dp(10), dp(10), dp(10))
+        for ((i, v) in vals.withIndex()) {
+            r.addView(cell(v, if (i == 0) 4f else 1f, bold, fg,
+                if (i == 0) Gravity.START else Gravity.CENTER))
+        }
+        return r
+    }
+
+    private fun stat(label: String, holder: LinearLayout): TextView {
+        val col = LinearLayout(this)
+        col.orientation = LinearLayout.VERTICAL
+        col.gravity = Gravity.CENTER
+        col.layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        val l = TextView(this)
+        l.text = label; l.textSize = 12f; l.setTextColor(Color.GRAY); l.gravity = Gravity.CENTER
+        val v = TextView(this)
+        v.textSize = 18f; v.setTypeface(null, Typeface.BOLD); v.setTextColor(Color.BLACK)
+        v.gravity = Gravity.CENTER
+        col.addView(l); col.addView(v); holder.addView(col)
+        return v
+    }
+
+    private fun key(label: String, bg: Int, fg: Int, onClick: () -> Unit): Button {
+        val b = Button(this)
+        b.text = label; b.textSize = 18f; b.isAllCaps = false
+        b.setTextColor(fg); b.setBackgroundColor(bg)
+        val lp = LinearLayout.LayoutParams(0, dp(56), 1f)
+        lp.setMargins(dp(3), dp(3), dp(3), dp(3))
+        b.layoutParams = lp
+        b.setOnClickListener { onClick() }
+        return b
+    }
+
+    private fun keyRow(vararg keys: Button): LinearLayout {
+        val r = LinearLayout(this)
+        r.orientation = LinearLayout.HORIZONTAL
+        for (k in keys) r.addView(k)
+        return r
     }
 
     override fun onCreate(b: Bundle?) {
         super.onCreate(b)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#101820"))
-            setPadding(32, 48, 32, 24)
-        }
-        tvTotal = tv(60f, Color.WHITE, true)
-        tvInfo = tv(18f, Color.LTGRAY)
-        tvBat = tv(20f, Color.parseColor("#7CFC9A"), true)
-        tvHeard = tv(16f, Color.parseColor("#FFD166"))
-        tvList = tv(15f, Color.WHITE).apply { typeface = Typeface.MONOSPACE }
-        root.addView(tvTotal); root.addView(tvInfo); root.addView(tvBat); root.addView(tvHeard)
-        val sv = ScrollView(this); sv.addView(tvList)
+
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(Color.parseColor("#FFFBFE"))
+        root.setPadding(dp(12), dp(28), dp(12), dp(8))
+
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        top.gravity = Gravity.CENTER_VERTICAL
+        val title = TextView(this)
+        title.text = "Voice Scorer"; title.textSize = 22f
+        title.setTextColor(GREEN); title.setTypeface(null, Typeface.BOLD)
+        title.layoutParams = LinearLayout.LayoutParams(0, -2, 1f)
+        val btnNew = Button(this)
+        btnNew.text = "New"; btnNew.setOnClickListener { confirmNew() }
+        top.addView(title); top.addView(btnNew)
+        root.addView(top)
+
+        tvScore = TextView(this)
+        tvScore.textSize = 46f; tvScore.setTypeface(null, Typeface.BOLD)
+        tvScore.setTextColor(Color.BLACK)
+        tvOvers = TextView(this)
+        tvOvers.textSize = 16f; tvOvers.setTextColor(Color.DKGRAY)
+        root.addView(tvScore); root.addView(tvOvers)
+
+        val stats = LinearLayout(this)
+        stats.orientation = LinearLayout.HORIZONTAL
+        stats.setPadding(0, dp(8), 0, dp(8))
+        tvCrr = stat("CRR", stats)
+        tvExtras = stat("Extras", stats)
+        tvProj = stat("Projected", stats)
+        tvLeft = stat("Balls left", stats)
+        root.addView(stats)
+
+        tableBox = LinearLayout(this)
+        tableBox.orientation = LinearLayout.VERTICAL
+        val sv = ScrollView(this)
+        sv.addView(tableBox)
         root.addView(sv, LinearLayout.LayoutParams(-1, 0, 1f))
 
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        btnMic = Button(this).apply { text = "Mic: ON"; setOnClickListener { toggleMic() } }
-        val btnUndo = Button(this).apply { text = "Undo"; setOnClickListener { apply("undo") } }
-        val btnNew = Button(this).apply { text = "New Innings"; setOnClickListener { confirmNew() } }
-        for (x in listOf(btnMic, btnUndo, btnNew)) row.addView(x, LinearLayout.LayoutParams(0, -2, 1f))
-        root.addView(row)
+        tvHeard = TextView(this)
+        tvHeard.textSize = 15f; tvHeard.setTextColor(Color.parseColor("#6D4C00"))
+        tvHeard.setPadding(dp(6), dp(6), dp(6), dp(6))
+        root.addView(tvHeard)
+
+        val neutral = Color.parseColor("#E7E0EC")
+        val dark = Color.parseColor("#1D1B20")
+        fun num(label: String, cmd: String) = key(label, neutral, dark) { apply(cmd) }
+        btnMic = key("Mic: ON", neutral, dark) { toggleMic() }
+        root.addView(keyRow(num("0", "dot"), num("1", "one"), num("2", "two"), num("3", "three")))
+        root.addView(keyRow(
+            key("4", Color.parseColor("#A5D6A7"), Color.parseColor("#1B5E20")) { apply("four") },
+            num("5", "five"),
+            key("6", Color.parseColor("#8E24AA"), Color.WHITE) { apply("six") },
+            key("W", Color.parseColor("#C62828"), Color.WHITE) { apply("out") }))
+        root.addView(keyRow(num("NB", "noball"), num("WD", "wide"), num("Undo", "undo"), btnMic))
         setContentView(root)
         refresh()
 
@@ -99,6 +199,7 @@ class MainActivity : Activity(), RecognitionListener {
 
     private fun startMic() {
         val rec = Recognizer(model, 16000.0f, GRAMMAR)
+        rec.setWords(true)
         speech = SpeechService(rec, 16000.0f)
         speech!!.startListening(this)
         tvHeard.text = "Tayyar. Bolo: one, two, four, six, out, wide, no ball, undo"
@@ -116,44 +217,56 @@ class MainActivity : Activity(), RecognitionListener {
             .setNegativeButton("Nahi", null).show()
     }
 
-    // ---- awaz ke natayej ----
+    // ---- awaz ----
     override fun onResult(h: String?) {
         if (h == null) return
-        val text = JSONObject(h).optString("text", "")
-        if (text.isBlank()) return
-        runOnUiThread { handle(text) }
+        val j = JSONObject(h)
+        val words = ArrayList<String>()
+        val arr = j.optJSONArray("result")
+        if (arr != null) {
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                if (o.optDouble("conf", 1.0) >= MIN_CONF) words.add(o.optString("word"))
+            }
+        } else {
+            val t = j.optString("text", "")
+            if (t.isNotBlank()) words.addAll(t.trim().split(" "))
+        }
+        if (words.isEmpty()) return
+        runOnUiThread { handle(words) }
     }
     override fun onPartialResult(h: String?) {}
     override fun onFinalResult(h: String?) {}
     override fun onError(e: Exception?) { runOnUiThread { tvHeard.text = "Error: " + e?.message } }
     override fun onTimeout() {}
 
-    private fun handle(text: String) {
-        val t = text.trim().split(" ").filter { it.isNotEmpty() }
+    private fun handle(words: List<String>) {
         var k = 0
-        while (k < t.size) {
-            val w = t[k]
-            if (w == "no") {
-                apply("noball"); k++
-                if (k < t.size && t[k] == "ball") k++
-                continue
+        while (k < words.size) {
+            val w = words[k]
+            if (w == "no" && k + 1 < words.size && words[k + 1] == "ball") {
+                apply("noball"); k += 2; continue
             }
-            if (w != "[unk]" && w != "ball") apply(w)
+            if (w in COMMANDS) apply(w)
+            else if (w.isNotEmpty() && w != "[unk]") tvHeard.text = "Ignore: $w"
             k++
         }
     }
 
-    // ---- score ka hisab ----
+    // ---- score ----
+    private fun finished() = st.wickets >= PLAYERS || st.balls >= TOTAL_OVERS * BALLS_PER_OVER
+
     private fun apply(cmd: String) {
         if (cmd == "undo") {
             if (history.isNotEmpty()) st = history.removeAt(history.size - 1)
             tvHeard.text = "Suna: undo"; refresh(); return
         }
-        if (st.wickets >= N) return
+        if (finished()) { tvHeard.text = "Innings khatam"; return }
         val snap = st.copy()
         val i = st.cur
+        var legal = true
         when (cmd) {
-            "wide", "noball" -> { st.total++; st.extras++ }   // 1 run, ball dobara hogi
+            "wide", "noball" -> { st.total++; st.extras++; legal = false }
             "out" -> { st.out[i] = true; st.bl[i]++; st.balls++; st.wickets++; st.cur++ }
             else -> {
                 val r = when (cmd) {
@@ -167,23 +280,36 @@ class MainActivity : Activity(), RecognitionListener {
             }
         }
         history.add(snap)
-        tvHeard.text = "Suna: $cmd"
+        var msg = "Suna: $cmd"
+        if (legal && st.balls > 0 && st.balls % BALLS_PER_OVER == 0) msg += "  (over khatam)"
+        if (finished()) msg = "Innings khatam"
+        tvHeard.text = msg
         (getSystemService(VIBRATOR_SERVICE) as Vibrator).vibrate(60)
         refresh()
     }
 
     private fun refresh() {
-        tvTotal.text = "${st.total}/${st.wickets}"
-        tvInfo.text = "Overs ${st.balls / 6}.${st.balls % 6}    Extras ${st.extras}"
-        tvBat.text = if (st.wickets >= N) "INNINGS KHATAM (sab out)"
-        else "Player ${st.cur + 1}: ${st.runs[st.cur]} (${st.bl[st.cur]})  4s:${st.f[st.cur]}  6s:${st.s[st.cur]}"
-        val sb = StringBuilder()
-        for (i in 0 until N) {
-            val mark = if (st.out[i]) "OUT" else if (i == st.cur && st.wickets < N) "<-" else ""
-            sb.append(String.format("P%-2d %3d (%2d)  4s:%d 6s:%d  %s\n",
-                i + 1, st.runs[i], st.bl[i], st.f[i], st.s[i], mark))
+        tvScore.text = "${st.total}/${st.wickets}"
+        tvOvers.text = "(${st.balls / BALLS_PER_OVER}.${st.balls % BALLS_PER_OVER}/$TOTAL_OVERS overs)"
+        val crr = if (st.balls > 0) st.total * BALLS_PER_OVER.toDouble() / st.balls else 0.0
+        tvCrr.text = "%.2f".format(crr)
+        tvExtras.text = st.extras.toString()
+        tvProj.text = Math.round(crr * TOTAL_OVERS).toString()
+        tvLeft.text = (TOTAL_OVERS * BALLS_PER_OVER - st.balls).toString()
+
+        tableBox.removeAllViews()
+        tableBox.addView(tableRow(listOf("BATSMAN", "R", "B", "4s", "6s", "SR"), GREEN, Color.WHITE, true))
+        val last = if (finished()) minOf(st.cur, PLAYERS - 1) else minOf(st.cur, PLAYERS - 1)
+        for (i in 0..last) {
+            val isCur = (i == st.cur && !finished())
+            val name = (if (isCur) "▶ " else "") + "Player ${i + 1}" + (if (st.out[i]) " (out)" else "")
+            val sr = if (st.bl[i] > 0) "%.1f".format(st.runs[i] * 100.0 / st.bl[i]) else "0.0"
+            val fg = if (st.out[i]) Color.parseColor("#757575") else Color.BLACK
+            val bg = if (isCur) Color.parseColor("#E8F5E9") else Color.TRANSPARENT
+            tableBox.addView(tableRow(
+                listOf(name, "${st.runs[i]}", "${st.bl[i]}", "${st.f[i]}", "${st.s[i]}", sr),
+                bg, fg, isCur))
         }
-        tvList.text = sb.toString()
     }
 
     override fun onDestroy() {
